@@ -1,0 +1,269 @@
+diff --git a/src/collectd.conf.pod b/src/collectd.conf.pod
+index 0e7a604..0f55d29 100644
+--- a/src/collectd.conf.pod
++++ b/src/collectd.conf.pod
+@@ -3175,6 +3175,7 @@ B<Synopsis:>
+     ReportSoftwareEvents true
+     EventList "/var/cache/pmu/GenuineIntel-6-2D-core.json"
+     HardwareEvents "L2_RQSTS.CODE_RD_HIT,L2_RQSTS.CODE_RD_MISS" "L2_RQSTS.ALL_CODE_RD"
++    Cores "0-3" "4,6" "[12-15]"
+   </Plugin>
+ 
+ B<Options:>
+@@ -3246,6 +3247,23 @@ event_download.py script to download event list for current CPU.
+ This field is a list of event names or groups of comma separated event names.
+ This option requires B<EventList> option to be configured.
+ 
++=item B<Cores> I<cores groups>
++
++All events are reported on a per core basis. Monitoring of the events can be
++configured for a group of cores (aggregated statistics). This field defines
++groups of cores on which to monitor supported events. The field is represented
++as list of strings with core group values. Each string represents a list of
++cores in a group. If a group is enclosed in square brackets each core is added
++individually to a separate group (that is statistics are not aggregated).
++Allowed formats are:
++    0,1,2,3
++    0-10,20-18
++    1,3,5-8,10,0x10-12
++    [4-15,32-63]
++
++If an empty string is provided as value for this field default cores
++configuration is applied - that is separate group is created for each core.
++
+ =back
+ 
+ =head2 Plugin C<intel_rdt>
+@@ -6858,7 +6876,7 @@ B<Synopsis:>
+    <ProcessMatch "name" "regex">
+      CollectFileDescriptor false
+      CollectContextSwitch true
+-   </Process>
++   </ProcessMatch>
+  </Plugin>
+ 
+ =over 4
+@@ -9192,6 +9210,11 @@ B<Options:>
+ =item B<Port> I<Port>
+ 
+ Port the embedded webserver should listen on. Defaults to B<9103>.
++Setting B<0> disable the webserver.
++
++=item B<MetricsDirectory> I<Path>
++
++Dump the metrics also as text format in a file under <Path>
+ 
+ =item B<StalenessDelta> I<Seconds>
+ 
+diff --git a/src/write_prometheus.c b/src/write_prometheus.c
+index 9e9ed2e..4ccef02 100644
+--- a/src/write_prometheus.c
++++ b/src/write_prometheus.c
+@@ -55,9 +55,10 @@ static c_avl_tree_t *metrics;
+ static pthread_mutex_t metrics_lock = PTHREAD_MUTEX_INITIALIZER;
+ 
+ static unsigned short httpd_port = 9103;
+-static struct MHD_Daemon *httpd;
++static struct MHD_Daemon *httpd = NULL;
+ 
+ static cdtime_t staleness_delta = PROMETHEUS_DEFAULT_STALENESS_DELTA;
++static char *metrics_dir = NULL;
+ 
+ /* Unfortunately, protoc-c doesn't export it's implementation of varint, so we
+  * need to implement our own. */
+@@ -80,8 +81,6 @@ static size_t varint(uint8_t buffer[static VARINT_UINT32_BYTES],
+  * to a buffer in ProtoBuf format. It prefixes each protobuf with its encoded
+  * size, the so called "delimited" format. */
+ static void format_protobuf(ProtobufCBuffer *buffer) {
+-  pthread_mutex_lock(&metrics_lock);
+-
+   char *unused_name;
+   Io__Prometheus__Client__MetricFamily *fam;
+   c_avl_iterator_t *iter = c_avl_get_iterator(metrics);
+@@ -98,8 +97,6 @@ static void format_protobuf(ProtobufCBuffer *buffer) {
+     io__prometheus__client__metric_family__pack_to_buffer(fam, buffer);
+   }
+   c_avl_iterator_destroy(iter);
+-
+-  pthread_mutex_unlock(&metrics_lock);
+ }
+ 
+ static char const *escape_label_value(char *buffer, size_t buffer_size,
+@@ -174,8 +171,6 @@ static char *format_labels(char *buffer, size_t buffer_size,
+ /* format_protobuf iterates over all metric families in "metrics" and adds them
+  * to a buffer in plain text format. */
+ static void format_text(ProtobufCBuffer *buffer) {
+-  pthread_mutex_lock(&metrics_lock);
+-
+   char *unused_name;
+   Io__Prometheus__Client__MetricFamily *fam;
+   c_avl_iterator_t *iter = c_avl_get_iterator(metrics);
+@@ -219,8 +214,6 @@ static void format_text(ProtobufCBuffer *buffer) {
+   snprintf(server, sizeof(server), "\n# collectd/write_prometheus %s at %s\n",
+            PACKAGE_VERSION, hostname_g);
+   buffer->append(buffer, strlen(server), (uint8_t *)server);
+-
+-  pthread_mutex_unlock(&metrics_lock);
+ }
+ 
+ /* http_handler is the callback called by the microhttpd library. It essentially
+@@ -252,10 +245,12 @@ static int http_handler(void *cls, struct MHD_Connection *connection,
+   ProtobufCBufferSimple simple = PROTOBUF_C_BUFFER_SIMPLE_INIT(scratch);
+   ProtobufCBuffer *buffer = (ProtobufCBuffer *)&simple;
+ 
++  pthread_mutex_lock(&metrics_lock);
+   if (want_proto)
+     format_protobuf(buffer);
+   else
+     format_text(buffer);
++  pthread_mutex_unlock(&metrics_lock);
+ 
+ #if defined(MHD_VERSION) && MHD_VERSION >= 0x00090500
+   struct MHD_Response *res = MHD_create_response_from_buffer(
+@@ -764,6 +759,16 @@ static int prom_open_socket(int addrfamily) {
+     if (fd == -1)
+       continue;
+ 
++    int tmp = 1;
++    if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &tmp, sizeof(tmp)) != 0) {
++      char errbuf[1024];
++      WARNING("write_prometheus: setsockopt(SO_REUSEADDR) failed: %s",
++              sstrerror(errno, errbuf, sizeof(errbuf)));
++      close(fd);
++      fd = -1;
++      continue;
++    }
++
+     if (bind(fd, ai->ai_addr, ai->ai_addrlen) != 0) {
+       close(fd);
+       fd = -1;
+@@ -794,8 +799,13 @@ static struct MHD_Daemon *prom_start_daemon() {
+     return NULL;
+   }
+ 
++  unsigned int flags = MHD_USE_THREAD_PER_CONNECTION | MHD_USE_DEBUG;
++#if MHD_VERSION >= 0x00095300
++  flags |= MHD_USE_INTERNAL_POLLING_THREAD;
++#endif
++
+   struct MHD_Daemon *d = MHD_start_daemon(
+-      MHD_USE_THREAD_PER_CONNECTION | MHD_USE_DEBUG, httpd_port,
++      flags, httpd_port,
+       /* MHD_AcceptPolicyCallback = */ NULL,
+       /* MHD_AcceptPolicyCallback arg = */ NULL, http_handler, NULL,
+       MHD_OPTION_LISTEN_SOCKET, fd, MHD_OPTION_EXTERNAL_LOGGER, prom_logger,
+@@ -838,6 +848,8 @@ static int prom_config(oconfig_item_t *ci) {
+         httpd_port = (unsigned short)status;
+     } else if (strcasecmp("StalenessDelta", child->key) == 0) {
+       cf_util_get_cdtime(child, &staleness_delta);
++    } else if (strcasecmp("MetricsDirectory", child->key) == 0) {
++      cf_util_get_string(child, &metrics_dir);
+     } else {
+       WARNING("write_prometheus plugin: Ignoring unknown configuration option "
+               "\"%s\".",
+@@ -857,19 +869,84 @@ static int prom_init() {
+     }
+   }
+ 
+-  if (httpd == NULL) {
+-    httpd = prom_start_daemon();
++  if (httpd_port > 0) {
+     if (httpd == NULL) {
+-      ERROR("write_prometheus plugin: MHD_start_daemon() failed.");
+-      return -1;
++      httpd = prom_start_daemon();
++      if (httpd == NULL) {
++        ERROR("write_prometheus plugin: MHD_start_daemon() failed.");
++        return -1;
++      }
++      DEBUG("write_prometheus plugin: Successfully started microhttpd %s",
++            MHD_get_version());
+     }
+-    DEBUG("write_prometheus plugin: Successfully started microhttpd %s",
+-          MHD_get_version());
++  } else {
++    INFO("write_prometheus plugin: HTTPD server disabled");
++  }
++
++  if (metrics_dir != NULL) {
++    INFO("write_prometheus plugin: writing metrics to '%s'", metrics_dir);
+   }
+ 
+   return 0;
+ }
+ 
++#define APPEND(ptr, ptr_size, str)  \
++  do {                              \
++    size_t l = strlen(str);         \
++    if (l >= ptr_size)              \
++      return ENOBUFS;               \
++    memcpy(ptr, (str), l);          \
++    ptr += l;                       \
++    ptr_size -= l;                  \
++} while (0)
++
++static int make_filename_from_vl(char *buffer, size_t buffer_size,
++                                 value_list_t const *vl) {
++  char *ptr = buffer;
++  size_t ptr_size = buffer_size;
++
++  if (metrics_dir != NULL) {
++    APPEND(ptr, ptr_size, metrics_dir);
++    APPEND(ptr, ptr_size, "/");
++  }
++  APPEND(ptr, ptr_size, vl->host);
++  APPEND(ptr, ptr_size, ".prom");
++  return 0;
++}
++
++#undef APPEND
++
++static int prom_dump(value_list_t const *vl) {
++  int status = 0;
++  uint8_t scratch[4096] = {0};
++  ProtobufCBufferSimple simple = PROTOBUF_C_BUFFER_SIMPLE_INIT(scratch);
++  ProtobufCBuffer *buffer = (ProtobufCBuffer *)&simple;
++
++  format_text(buffer);
++
++  char filename[512];
++
++  status = make_filename_from_vl(filename, sizeof(filename), vl);
++  if (status != 0)
++    return status;
++
++  if (check_create_dir(filename))
++    return -1;
++
++  FILE *sink = fopen(filename, "w");
++  if (sink == NULL)
++    return -1;
++
++  if (fwrite(simple.data, simple.len, 1, sink) != 1) {
++    status = -1;
++  }
++
++  status = fclose(sink);
++
++  PROTOBUF_C_BUFFER_SIMPLE_CLEAR(&simple);
++  return status;
++}
++
+ static int prom_write(data_set_t const *ds, value_list_t const *vl,
+                       __attribute__((unused)) user_data_t *ud) {
+   pthread_mutex_lock(&metrics_lock);
+@@ -889,8 +966,13 @@ static int prom_write(data_set_t const *ds, value_list_t const *vl,
+     }
+   }
+ 
++  int status = 0;
++
++  if (metrics_dir != NULL)
++    status = prom_dump(vl);
++
+   pthread_mutex_unlock(&metrics_lock);
+-  return 0;
++  return status;
+ }
+ 
+ static int prom_missing(value_list_t const *vl,
